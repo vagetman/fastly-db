@@ -1,0 +1,21 @@
+# This file describes a Fastly Compute package. To learn more visit:
+# https://www.fastly.com/documentation/reference/compute/fastly-toml
+
+authors = ["vgetmanshchuk@fastly.com"]
+cloned_from = "https://github.com/fastly/compute-starter-kit-rust-default"
+description = ""
+language = "rust"
+manifest_version = 3
+name = "fastly-db"
+service_id = "oftptUeFAjXPwOy5Lxilsc"
+
+[local_server]
+
+[local_server.kv_stores]
+
+[local_server.kv_stores.sql_data]
+file = "kv-seed.json"
+format = "json"
+
+[scripts]
+build = "cargo build --profile release"
