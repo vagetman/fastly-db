@@ -26,8 +26,11 @@ fn main() -> Result<(), Error> {
 fn ensure_db(ctx: &mut AppContext) {
     if ctx.glue.is_some() {
         // Incremental refresh — pick up new deltas from other sandboxes
-        let glue = ctx.glue.as_mut().unwrap();
-        let journal = ctx.journal.as_mut().unwrap();
+        let glue = ctx.glue.as_mut().expect("db initialized by ensure_db");
+        let journal = ctx
+            .journal
+            .as_mut()
+            .expect("journal initialized by ensure_db");
         db::refresh_db(glue, journal);
     } else {
         // First request — full load
@@ -51,15 +54,27 @@ fn handle(mut req: Request, ctx: &mut AppContext) -> Result<Response, Error> {
         (Method::POST, "/query") => {
             let sql = req.take_body_str();
             ensure_db(ctx);
-            let glue = ctx.glue.as_mut().unwrap();
+            let glue = ctx.glue.as_mut().expect("db initialized by ensure_db");
 
             match db::execute_query(glue, &sql) {
                 Ok((json, has_mutations)) => {
                     if has_mutations {
-                        db::append_to_log(&sql);
+                        if let Err(err) = db::append_to_log(&sql) {
+                            let body = serde_json::json!({
+                                "error": format!("query executed but failed to persist: {}", err)
+                            })
+                            .to_string();
+                            return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .with_content_type(mime::APPLICATION_JSON)
+                                .with_body(body));
+                        }
+                        let journal = ctx
+                            .journal
+                            .as_mut()
+                            .expect("journal initialized by ensure_db");
+                        journal.refreshes_since_list = 0;
+                        db::maybe_compact(journal);
                     }
-                    let journal = ctx.journal.as_ref().unwrap();
-                    db::maybe_compact(journal);
                     Ok(Response::from_status(StatusCode::OK)
                         .with_content_type(mime::APPLICATION_JSON)
                         .with_body(json))
@@ -76,15 +91,11 @@ fn handle(mut req: Request, ctx: &mut AppContext) -> Result<Response, Error> {
         // Dynamic schema introspection
         (Method::GET, "/schema") => {
             ensure_db(ctx);
-            let glue = ctx.glue.as_mut().unwrap();
+            let glue = ctx.glue.as_mut().expect("db initialized by ensure_db");
             match db::get_schema(glue) {
-                Ok(json) => {
-                    let journal = ctx.journal.as_ref().unwrap();
-                    db::maybe_compact(journal);
-                    Ok(Response::from_status(StatusCode::OK)
-                        .with_content_type(mime::APPLICATION_JSON)
-                        .with_body(json))
-                }
+                Ok(json) => Ok(Response::from_status(StatusCode::OK)
+                    .with_content_type(mime::APPLICATION_JSON)
+                    .with_body(json)),
                 Err(err) => {
                     let body = serde_json::json!({ "error": err }).to_string();
                     Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)

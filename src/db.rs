@@ -8,9 +8,13 @@ use uuid::Uuid;
 
 /// Trivial single-threaded block_on for WASM — no runtime needed.
 fn block_on<F: Future>(mut fut: F) -> F::Output {
+    // SAFETY: fut is a stack local, never moved after pinning.
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
+    // Single-poll executor: in WASM all I/O completes synchronously, so the
+    // future is always Ready on the first poll. If it were Pending, there is
+    // no reactor to wake us, so we panic rather than busy-loop.
     #[allow(clippy::never_loop)]
     loop {
         match fut.as_mut().poll(&mut cx) {
@@ -23,6 +27,8 @@ fn block_on<F: Future>(mut fut: F) -> F::Output {
 const fn noop_waker() -> Waker {
     const VTABLE: RawWakerVTable =
         RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
+    // SAFETY: vtable functions are no-ops; valid for a waker that is never
+    // truly woken (single-threaded WASM with no pending futures).
     unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
 }
 
@@ -31,6 +37,35 @@ const SQL_KEY_PREFIX: &str = "__sql_";
 const SNAPSHOT_KEY: &str = "__meta_snapshot";
 const COMPACT_KEY_THRESHOLD: usize = 50;
 const COMPACT_AGE_SECS: u64 = 300;
+const RELIST_INTERVAL: u32 = 10;
+
+/// Paginate through all `__sql_*` keys in the KV store and return them sorted.
+fn list_delta_keys(kv: &KVStore) -> Vec<String> {
+    let first_page = match kv.build_list().prefix(SQL_KEY_PREFIX).limit(1000).execute() {
+        Ok(page) => page,
+        Err(_) => return Vec::new(),
+    };
+    let mut cursor = first_page.next_cursor();
+    let mut keys: Vec<String> = first_page.into_keys();
+    while let Some(ref c) = cursor {
+        match kv
+            .build_list()
+            .prefix(SQL_KEY_PREFIX)
+            .limit(1000)
+            .cursor(c)
+            .execute()
+        {
+            Ok(page) => {
+                cursor = page.next_cursor();
+                keys.extend(page.into_keys());
+            }
+            Err(_) => break,
+        }
+    }
+    // UUIDv7 hex sorts lexicographically by time
+    keys.sort();
+    keys
+}
 
 pub struct JournalState {
     pub stmts: Vec<String>,
@@ -39,6 +74,7 @@ pub struct JournalState {
     pub snapshot_gen: u64,
     pub current_boundary: Option<String>,
     pub prev_boundary: Option<String>,
+    pub refreshes_since_list: u32,
 }
 
 /// Load the database by replaying the SQL journal from KV Store.
@@ -79,6 +115,14 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
         return true;
     }
 
+    // Skip expensive paginated key listing most of the time.
+    // Callers that write mutations reset refreshes_since_list to 0.
+    journal.refreshes_since_list += 1;
+    if journal.refreshes_since_list < RELIST_INTERVAL && !journal.all_keys.is_empty() {
+        return false;
+    }
+    journal.refreshes_since_list = 0;
+
     // Determine the boundary: newest key we've already seen
     let boundary = journal
         .delta_keys
@@ -86,29 +130,7 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
         .or(journal.current_boundary.as_ref());
 
     // List all delta keys
-    let mut keys: Vec<String> = Vec::new();
-    let first_page = match kv.build_list().prefix(SQL_KEY_PREFIX).limit(1000).execute() {
-        Ok(page) => page,
-        Err(_) => return false,
-    };
-    let mut cursor = first_page.next_cursor();
-    keys.extend(first_page.into_keys());
-    while let Some(ref c) = cursor {
-        match kv
-            .build_list()
-            .prefix(SQL_KEY_PREFIX)
-            .limit(1000)
-            .cursor(c)
-            .execute()
-        {
-            Ok(page) => {
-                cursor = page.next_cursor();
-                keys.extend(page.into_keys());
-            }
-            Err(_) => break,
-        }
-    }
-    keys.sort();
+    let keys = list_delta_keys(&kv);
 
     // Find new keys beyond our boundary
     let new_keys: Vec<String> = boundary.map_or_else(
@@ -150,7 +172,7 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
 /// the oldest delta is older than 5 minutes.
 /// Uses CAS (if_generation_match) to prevent concurrent compaction across regions.
 /// Deletes only keys older than the previous compaction boundary (2-generation lag).
-pub fn maybe_compact(journal: &JournalState) {
+pub fn maybe_compact(journal: &mut JournalState) {
     if journal.delta_keys.is_empty() {
         return;
     }
@@ -166,13 +188,13 @@ pub fn maybe_compact(journal: &JournalState) {
 
     let snapshot_body = journal.stmts.join("\n");
     let last_delta = match journal.delta_keys.last() {
-        Some(k) => k.as_str(),
+        Some(k) => k.clone(),
         None => return,
     };
 
     // Build metadata JSON: rotate current -> prev
     let meta = serde_json::json!({
-        "current": last_delta,
+        "current": &last_delta,
         "prev": journal.current_boundary,
     });
     let meta_str = meta.to_string();
@@ -190,7 +212,16 @@ pub fn maybe_compact(journal: &JournalState) {
         return;
     }
 
-    // CAS succeeded. Delete delta keys that are older than the previous boundary
+    // CAS succeeded — update journal state so the next refresh_db() doesn't
+    // see a generation mismatch and trigger a full reload.
+    if let Ok(resp) = kv.build_lookup().execute(SNAPSHOT_KEY) {
+        journal.snapshot_gen = resp.current_generation();
+    }
+    journal.prev_boundary = journal.current_boundary.take();
+    journal.current_boundary = Some(last_delta);
+    journal.delta_keys.clear();
+
+    // Delete delta keys that are older than the previous boundary
     // (2-generation lag: these were folded into at least the prior snapshot,
     // giving it time to propagate across all PoPs).
     if let Some(ref prev) = journal.prev_boundary {
@@ -311,38 +342,34 @@ pub fn execute_query(glue: &mut Glue<MemoryStorage>, sql: &str) -> Result<(Strin
         }
     }
 
-    let output = if all_rows.len() == 1 {
-        serde_json::to_string_pretty(&all_rows.into_iter().next().unwrap())
-    } else {
-        serde_json::to_string_pretty(&all_rows)
-    };
+    let envelope = serde_json::json!({ "results": all_rows });
+    let output = serde_json::to_string_pretty(&envelope);
 
     output
         .map(|json| (json, has_mutations))
         .map_err(|e| e.to_string())
 }
 
-/// Append the user's SQL statements to a new sharded journal key (concurrent-safe).
-pub fn append_to_log(new_sql: &str) {
-    let kv = match KVStore::open(KV_STORE_NAME) {
-        Ok(Some(kv)) => kv,
-        _ => return,
-    };
-    let mut payload = String::new();
-    for stmt in new_sql.split(';') {
-        let stmt = stmt.trim();
-        if !stmt.is_empty() {
-            payload.push_str(stmt);
-            payload.push('\n');
-        }
+/// Append the user's SQL to a new sharded journal key (concurrent-safe).
+/// Returns an error if the KV store is unavailable or the write fails.
+pub fn append_to_log(new_sql: &str) -> Result<(), String> {
+    // Normalize newlines so the line-based journal format stays intact,
+    // but do NOT split on ';' — that breaks string literals like 'a;b'.
+    let sql = new_sql.replace(['\n', '\r'], " ");
+    let sql = sql.trim();
+    if sql.is_empty() {
+        return Ok(());
     }
-    if !payload.is_empty() {
-        let key = format!("{}{}", SQL_KEY_PREFIX, Uuid::now_v7());
-        kv.build_insert()
-            .mode(InsertMode::Add)
-            .execute(&key, payload)
-            .ok();
-    }
+
+    let kv = KVStore::open(KV_STORE_NAME)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("KV store '{}' not found", KV_STORE_NAME))?;
+
+    let key = format!("{}{}", SQL_KEY_PREFIX, Uuid::now_v7());
+    kv.build_insert()
+        .mode(InsertMode::Add)
+        .execute(&key, sql)
+        .map_err(|e| e.to_string())
 }
 
 /// Query actual schema from GlueSQL's data dictionary tables.
@@ -403,6 +430,7 @@ fn load_sql_log() -> JournalState {
                 snapshot_gen: 0,
                 current_boundary: None,
                 prev_boundary: None,
+                refreshes_since_list: 0,
             }
         }
     };
@@ -442,40 +470,7 @@ fn load_sql_log() -> JournalState {
     }
 
     // List all delta keys, paginating through all results
-    let mut keys: Vec<String> = Vec::new();
-    let first_page = match kv.build_list().prefix(SQL_KEY_PREFIX).limit(1000).execute() {
-        Ok(page) => page,
-        Err(_) => {
-            return JournalState {
-                stmts,
-                all_keys: Vec::new(),
-                delta_keys: Vec::new(),
-                snapshot_gen,
-                current_boundary,
-                prev_boundary,
-            }
-        }
-    };
-    let mut cursor = first_page.next_cursor();
-    keys.extend(first_page.into_keys());
-    while let Some(ref c) = cursor {
-        match kv
-            .build_list()
-            .prefix(SQL_KEY_PREFIX)
-            .limit(1000)
-            .cursor(c)
-            .execute()
-        {
-            Ok(page) => {
-                cursor = page.next_cursor();
-                keys.extend(page.into_keys());
-            }
-            Err(_) => break,
-        }
-    }
-
-    // Sort keys — UUIDv7 hex sorts lexicographically by time
-    keys.sort();
+    let keys = list_delta_keys(&kv);
 
     // Keep only delta keys newer than the snapshot boundary
     let delta_keys: Vec<String> = current_boundary.as_ref().map_or_else(
@@ -508,6 +503,7 @@ fn load_sql_log() -> JournalState {
         snapshot_gen,
         current_boundary,
         prev_boundary,
+        refreshes_since_list: 0,
     }
 }
 
