@@ -1,7 +1,30 @@
 use fastly::kv_store::InsertMode;
 use fastly::KVStore;
 use gluesql::prelude::*;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use uuid::Uuid;
+
+/// Trivial single-threaded block_on for WASM — no runtime needed.
+fn block_on<F: Future>(mut fut: F) -> F::Output {
+    let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    #[allow(clippy::never_loop)]
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(val) => return val,
+            Poll::Pending => panic!("unexpected Pending in single-threaded WASM"),
+        }
+    }
+}
+
+fn noop_waker() -> Waker {
+    const VTABLE: RawWakerVTable =
+        RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
+    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+}
 
 const KV_STORE_NAME: &str = "sql_data";
 const SQL_KEY_PREFIX: &str = "__sql_";
@@ -19,17 +42,107 @@ pub struct JournalState {
 }
 
 /// Load the database by replaying the SQL journal from KV Store.
-pub async fn load_db() -> (Glue<MemoryStorage>, JournalState) {
+pub fn load_db() -> (Glue<MemoryStorage>, JournalState) {
     let storage = MemoryStorage::default();
     let mut glue = Glue::new(storage);
 
     let journal = load_sql_log();
 
     for stmt in &journal.stmts {
-        glue.execute(stmt).await.ok();
+        block_on(glue.execute(stmt)).ok();
     }
 
     (glue, journal)
+}
+
+/// Incrementally refresh the database by loading only new delta keys since
+/// the last known state. If the snapshot generation changed (another sandbox
+/// compacted), falls back to a full reload.
+/// Returns true if a full reload was performed.
+pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) -> bool {
+    let kv = match KVStore::open(KV_STORE_NAME) {
+        Ok(Some(kv)) => kv,
+        _ => return false,
+    };
+
+    // Check if snapshot generation changed (another sandbox compacted)
+    let current_gen = match kv.build_lookup().execute(SNAPSHOT_KEY) {
+        Ok(resp) => resp.current_generation(),
+        Err(_) => 0,
+    };
+
+    if current_gen != journal.snapshot_gen {
+        // Another sandbox compacted — full reload needed
+        let (new_glue, new_journal) = load_db();
+        *glue = new_glue;
+        *journal = new_journal;
+        return true;
+    }
+
+    // Determine the boundary: newest key we've already seen
+    let boundary = journal
+        .delta_keys
+        .last()
+        .or(journal.current_boundary.as_ref());
+
+    // List all delta keys
+    let mut keys: Vec<String> = Vec::new();
+    let first_page = match kv.build_list().prefix(SQL_KEY_PREFIX).limit(1000).execute() {
+        Ok(page) => page,
+        Err(_) => return false,
+    };
+    let mut cursor = first_page.next_cursor().map(String::from);
+    keys.extend(first_page.into_keys());
+    while let Some(ref c) = cursor {
+        match kv
+            .build_list()
+            .prefix(SQL_KEY_PREFIX)
+            .limit(1000)
+            .cursor(c)
+            .execute()
+        {
+            Ok(page) => {
+                cursor = page.next_cursor().map(String::from);
+                keys.extend(page.into_keys());
+            }
+            Err(_) => break,
+        }
+    }
+    keys.sort();
+
+    // Find new keys beyond our boundary
+    let new_keys: Vec<String> = if let Some(b) = boundary {
+        keys.iter()
+            .filter(|k| k.as_str() > b.as_str())
+            .cloned()
+            .collect()
+    } else {
+        keys.clone()
+    };
+
+    if new_keys.is_empty() {
+        // Update all_keys in case deletions happened
+        journal.all_keys = keys;
+        return false;
+    }
+
+    // Read and replay only the new delta keys
+    for key in &new_keys {
+        if let Ok(mut resp) = kv.lookup(key) {
+            let body = resp.take_body().into_string();
+            for line in body.lines() {
+                let line = line.trim();
+                if !line.is_empty() {
+                    block_on(glue.execute(line)).ok();
+                    journal.stmts.push(line.to_string());
+                }
+            }
+        }
+    }
+
+    journal.delta_keys.extend(new_keys);
+    journal.all_keys = keys;
+    false
 }
 
 /// Try to compact the journal if enough delta keys have accumulated or
@@ -115,11 +228,8 @@ fn should_compact(journal: &JournalState) -> bool {
 }
 
 /// Execute SQL and return (json_result, has_mutations).
-pub async fn execute_query(
-    glue: &mut Glue<MemoryStorage>,
-    sql: &str,
-) -> Result<(String, bool), String> {
-    let results = glue.execute(sql).await.map_err(|e| e.to_string())?;
+pub fn execute_query(glue: &mut Glue<MemoryStorage>, sql: &str) -> Result<(String, bool), String> {
+    let results = block_on(glue.execute(sql)).map_err(|e| e.to_string())?;
 
     let mut all_rows: Vec<Vec<serde_json::Map<String, serde_json::Value>>> = Vec::new();
     let mut has_mutations = false;
@@ -235,12 +345,10 @@ pub fn append_to_log(new_sql: &str) {
 }
 
 /// Query actual schema from GlueSQL's data dictionary tables.
-pub async fn get_schema(glue: &mut Glue<MemoryStorage>) -> Result<String, String> {
+pub fn get_schema(glue: &mut Glue<MemoryStorage>) -> Result<String, String> {
     // Get all table names
-    let results = glue
-        .execute("SELECT TABLE_NAME FROM GLUE_TABLES")
-        .await
-        .map_err(|e| e.to_string())?;
+    let results =
+        block_on(glue.execute("SELECT TABLE_NAME FROM GLUE_TABLES")).map_err(|e| e.to_string())?;
 
     let mut tables: Vec<String> = Vec::new();
     for payload in results {
@@ -262,7 +370,7 @@ pub async fn get_schema(glue: &mut Glue<MemoryStorage>) -> Result<String, String
             "SELECT COLUMN_NAME, COLUMN_ID, NULLABLE, KEY, DEFAULT FROM GLUE_TABLE_COLUMNS WHERE TABLE_NAME = '{}'",
             table
         );
-        if let Ok(col_results) = glue.execute(&col_sql).await {
+        if let Ok(col_results) = block_on(glue.execute(&col_sql)) {
             let mut columns: Vec<serde_json::Value> = Vec::new();
             for payload in col_results {
                 if let Payload::Select { labels, rows } = payload {
