@@ -20,7 +20,7 @@ fn block_on<F: Future>(mut fut: F) -> F::Output {
     }
 }
 
-fn noop_waker() -> Waker {
+const fn noop_waker() -> Waker {
     const VTABLE: RawWakerVTable =
         RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
     unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
@@ -66,10 +66,10 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
     };
 
     // Check if snapshot generation changed (another sandbox compacted)
-    let current_gen = match kv.build_lookup().execute(SNAPSHOT_KEY) {
-        Ok(resp) => resp.current_generation(),
-        Err(_) => 0,
-    };
+    let current_gen = kv
+        .build_lookup()
+        .execute(SNAPSHOT_KEY)
+        .map_or(0, |resp| resp.current_generation());
 
     if current_gen != journal.snapshot_gen {
         // Another sandbox compacted — full reload needed
@@ -91,7 +91,7 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
         Ok(page) => page,
         Err(_) => return false,
     };
-    let mut cursor = first_page.next_cursor().map(String::from);
+    let mut cursor = first_page.next_cursor();
     keys.extend(first_page.into_keys());
     while let Some(ref c) = cursor {
         match kv
@@ -102,7 +102,7 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
             .execute()
         {
             Ok(page) => {
-                cursor = page.next_cursor().map(String::from);
+                cursor = page.next_cursor();
                 keys.extend(page.into_keys());
             }
             Err(_) => break,
@@ -111,14 +111,15 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
     keys.sort();
 
     // Find new keys beyond our boundary
-    let new_keys: Vec<String> = if let Some(b) = boundary {
-        keys.iter()
-            .filter(|k| k.as_str() > b.as_str())
-            .cloned()
-            .collect()
-    } else {
-        keys.clone()
-    };
+    let new_keys: Vec<String> = boundary.map_or_else(
+        || keys.clone(),
+        |b| {
+            keys.iter()
+                .filter(|k| k.as_str() > b.as_str())
+                .cloned()
+                .collect()
+        },
+    );
 
     if new_keys.is_empty() {
         // Update all_keys in case deletions happened
@@ -455,7 +456,7 @@ fn load_sql_log() -> JournalState {
             }
         }
     };
-    let mut cursor = first_page.next_cursor().map(String::from);
+    let mut cursor = first_page.next_cursor();
     keys.extend(first_page.into_keys());
     while let Some(ref c) = cursor {
         match kv
@@ -466,7 +467,7 @@ fn load_sql_log() -> JournalState {
             .execute()
         {
             Ok(page) => {
-                cursor = page.next_cursor().map(String::from);
+                cursor = page.next_cursor();
                 keys.extend(page.into_keys());
             }
             Err(_) => break,
@@ -477,14 +478,15 @@ fn load_sql_log() -> JournalState {
     keys.sort();
 
     // Keep only delta keys newer than the snapshot boundary
-    let delta_keys: Vec<String> = if let Some(ref last) = current_boundary {
-        keys.iter()
-            .filter(|k| k.as_str() > last.as_str())
-            .cloned()
-            .collect()
-    } else {
-        keys.clone()
-    };
+    let delta_keys: Vec<String> = current_boundary.as_ref().map_or_else(
+        || keys.clone(),
+        |last| {
+            keys.iter()
+                .filter(|k| k.as_str() > last.as_str())
+                .cloned()
+                .collect()
+        },
+    );
 
     // Read each delta key
     for key in &delta_keys {
