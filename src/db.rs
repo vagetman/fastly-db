@@ -68,7 +68,6 @@ fn list_delta_keys(kv: &KVStore) -> Vec<String> {
 }
 
 pub struct JournalState {
-    pub stmts: Vec<String>,
     pub all_keys: Vec<String>,
     pub delta_keys: Vec<String>,
     pub snapshot_gen: u64,
@@ -77,16 +76,105 @@ pub struct JournalState {
     pub refreshes_since_list: u32,
 }
 
-/// Load the database by replaying the SQL journal from KV Store.
+/// Load the database from KV Store. Tries to deserialize a binary snapshot
+/// of MemoryStorage first; falls back to legacy SQL replay for migration.
 pub fn load_db() -> (Glue<MemoryStorage>, JournalState) {
-    let storage = MemoryStorage::default();
+    let kv = match KVStore::open(KV_STORE_NAME) {
+        Ok(Some(kv)) => kv,
+        _ => {
+            return (
+                Glue::new(MemoryStorage::default()),
+                JournalState {
+                    all_keys: Vec::new(),
+                    delta_keys: Vec::new(),
+                    snapshot_gen: 0,
+                    current_boundary: None,
+                    prev_boundary: None,
+                    refreshes_since_list: 0,
+                },
+            )
+        }
+    };
+
+    let mut snapshot_gen: u64 = 0;
+    let mut current_boundary: Option<String> = None;
+    let mut prev_boundary: Option<String> = None;
+    let mut storage = MemoryStorage::default();
+
+    // Load compacted snapshot if it exists
+    if let Ok(mut resp) = kv.build_lookup().execute(SNAPSHOT_KEY) {
+        snapshot_gen = resp.current_generation();
+
+        // Parse JSON metadata: {"current":"...","prev":"..."}
+        if let Some(meta_bytes) = resp.metadata() {
+            if let Ok(meta_str) = String::from_utf8(meta_bytes.to_vec()) {
+                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+                    current_boundary = meta
+                        .get("current")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    prev_boundary = meta.get("prev").and_then(|v| v.as_str()).map(String::from);
+                } else {
+                    // Legacy plain-text metadata (pre-JSON format)
+                    current_boundary = Some(meta_str);
+                }
+            }
+        }
+
+        let body_bytes = resp.take_body().into_bytes();
+
+        // Try deserializing as MemoryStorage.
+        // Migration chain: bincode (current) → serde_json (previous) → SQL replay (legacy).
+        if let Ok(restored) = bincode::deserialize::<MemoryStorage>(&body_bytes) {
+            storage = restored;
+        } else if let Ok(body_str) = std::str::from_utf8(&body_bytes) {
+            if let Ok(restored) = serde_json::from_str::<MemoryStorage>(body_str) {
+                storage = restored;
+            } else {
+                // Legacy SQL-text snapshot — replay each line
+                let mut glue = Glue::new(storage);
+                for line in body_str.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+                    block_on(glue.execute(line)).ok();
+                }
+                storage = glue.storage;
+            }
+        }
+    }
+
     let mut glue = Glue::new(storage);
 
-    let journal = load_sql_log();
+    // List all delta keys
+    let keys = list_delta_keys(&kv);
 
-    for stmt in &journal.stmts {
-        block_on(glue.execute(stmt)).ok();
+    // Keep only delta keys newer than the snapshot boundary
+    let delta_keys: Vec<String> = current_boundary.as_ref().map_or_else(
+        || keys.clone(),
+        |last| {
+            keys.iter()
+                .filter(|k| k.as_str() > last.as_str())
+                .cloned()
+                .collect()
+        },
+    );
+
+    // Replay only delta keys on top of the snapshot
+    for key in &delta_keys {
+        if let Ok(mut resp) = kv.lookup(key) {
+            let body = resp.take_body().into_string();
+            for line in body.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+                block_on(glue.execute(line)).ok();
+            }
+        }
     }
+
+    let journal = JournalState {
+        all_keys: keys,
+        delta_keys,
+        snapshot_gen,
+        current_boundary,
+        prev_boundary,
+        refreshes_since_list: 0,
+    };
 
     (glue, journal)
 }
@@ -152,12 +240,8 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
     for key in &new_keys {
         if let Ok(mut resp) = kv.lookup(key) {
             let body = resp.take_body().into_string();
-            for line in body.lines() {
-                let line = line.trim();
-                if !line.is_empty() {
-                    block_on(glue.execute(line)).ok();
-                    journal.stmts.push(line.to_string());
-                }
+            for line in body.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+                block_on(glue.execute(line)).ok();
             }
         }
     }
@@ -171,7 +255,7 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
 /// the oldest delta is older than 5 minutes.
 /// Uses CAS (if_generation_match) to prevent concurrent compaction across regions.
 /// Deletes only keys older than the previous compaction boundary (2-generation lag).
-pub fn maybe_compact(journal: &mut JournalState) {
+pub fn maybe_compact(journal: &mut JournalState, storage: &MemoryStorage) {
     if journal.delta_keys.is_empty() {
         return;
     }
@@ -185,13 +269,13 @@ pub fn maybe_compact(journal: &mut JournalState) {
         _ => return,
     };
 
-    do_compact(journal, &kv);
+    do_compact(journal, &kv, storage);
 }
 
 /// Unconditionally compact: re-list delta keys from KV, re-read snapshot
 /// generation, and fold everything into the snapshot. Called on sandbox
 /// shutdown to catch writes that accumulated after the last `maybe_compact`.
-pub fn force_compact(journal: &mut JournalState) {
+pub fn force_compact(journal: &mut JournalState, storage: &MemoryStorage) {
     let kv = match KVStore::open(KV_STORE_NAME) {
         Ok(Some(kv)) => kv,
         _ => return,
@@ -222,13 +306,16 @@ pub fn force_compact(journal: &mut JournalState) {
         return;
     }
 
-    do_compact(journal, &kv);
+    do_compact(journal, &kv, storage);
 }
 
-/// Shared compaction logic: write snapshot via CAS, rotate boundaries,
+/// Shared compaction logic: serialize MemoryStorage via CAS, rotate boundaries,
 /// and delete old delta keys.
-fn do_compact(journal: &mut JournalState, kv: &KVStore) {
-    let snapshot_body = journal.stmts.join("\n");
+fn do_compact(journal: &mut JournalState, kv: &KVStore, storage: &MemoryStorage) {
+    let snapshot_body = match bincode::serialize(storage) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
     let last_delta = match journal.delta_keys.last() {
         Some(k) => k.clone(),
         None => return,
@@ -461,93 +548,7 @@ pub fn get_schema(glue: &mut Glue<MemoryStorage>) -> Result<String, String> {
     serde_json::to_string_pretty(&schema).map_err(|e| e.to_string())
 }
 
-fn load_sql_log() -> JournalState {
-    let kv = match KVStore::open(KV_STORE_NAME) {
-        Ok(Some(kv)) => kv,
-        _ => {
-            return JournalState {
-                stmts: Vec::new(),
-                all_keys: Vec::new(),
-                delta_keys: Vec::new(),
-                snapshot_gen: 0,
-                current_boundary: None,
-                prev_boundary: None,
-                refreshes_since_list: 0,
-            }
-        }
-    };
 
-    let mut stmts: Vec<String> = Vec::new();
-    let mut snapshot_gen: u64 = 0;
-    let mut current_boundary: Option<String> = None;
-    let mut prev_boundary: Option<String> = None;
-
-    // Load compacted snapshot if it exists
-    if let Ok(mut resp) = kv.build_lookup().execute(SNAPSHOT_KEY) {
-        snapshot_gen = resp.current_generation();
-
-        // Parse JSON metadata: {"current":"...","prev":"..."}
-        if let Some(meta_bytes) = resp.metadata() {
-            if let Ok(meta_str) = String::from_utf8(meta_bytes.to_vec()) {
-                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
-                    current_boundary = meta
-                        .get("current")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    prev_boundary = meta.get("prev").and_then(|v| v.as_str()).map(String::from);
-                } else {
-                    // Legacy plain-text metadata (pre-JSON format)
-                    current_boundary = Some(meta_str);
-                }
-            }
-        }
-
-        let body = resp.take_body().into_string();
-        stmts.extend(
-            body.lines()
-                .map(|l| l.trim())
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string()),
-        );
-    }
-
-    // List all delta keys, paginating through all results
-    let keys = list_delta_keys(&kv);
-
-    // Keep only delta keys newer than the snapshot boundary
-    let delta_keys: Vec<String> = current_boundary.as_ref().map_or_else(
-        || keys.clone(),
-        |last| {
-            keys.iter()
-                .filter(|k| k.as_str() > last.as_str())
-                .cloned()
-                .collect()
-        },
-    );
-
-    // Read each delta key
-    for key in &delta_keys {
-        if let Ok(mut resp) = kv.lookup(key) {
-            let body = resp.take_body().into_string();
-            stmts.extend(
-                body.lines()
-                    .map(|l| l.trim())
-                    .filter(|l| !l.is_empty())
-                    .map(|l| l.to_string()),
-            );
-        }
-    }
-
-    JournalState {
-        stmts,
-        all_keys: keys,
-        delta_keys,
-        snapshot_gen,
-        current_boundary,
-        prev_boundary,
-        refreshes_since_list: 0,
-    }
-}
 
 fn value_to_json(v: Value) -> serde_json::Value {
     match v {

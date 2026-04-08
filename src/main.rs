@@ -24,8 +24,8 @@ fn main() -> Result<(), Error> {
 
     // Sandbox is shutting down — compact unconditionally to fold
     // any remaining delta keys into the snapshot.
-    if let Some(journal) = ctx.journal.as_mut() {
-        db::force_compact(journal);
+    if let (Some(journal), Some(glue)) = (ctx.journal.as_mut(), ctx.glue.as_ref()) {
+        db::force_compact(journal, &glue.storage);
     }
 
     Ok(())
@@ -80,7 +80,12 @@ fn handle(mut req: Request, ctx: &mut AppContext) -> Result<Response, Error> {
                             .journal
                             .as_mut()
                             .expect("journal initialized by ensure_db");
-                        db::maybe_compact(journal);
+                        let storage = &ctx
+                            .glue
+                            .as_ref()
+                            .expect("db initialized by ensure_db")
+                            .storage;
+                        db::maybe_compact(journal, storage);
                     }
                     Ok(Response::from_status(StatusCode::OK)
                         .with_content_type(mime::APPLICATION_JSON)
