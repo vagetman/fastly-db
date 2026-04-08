@@ -116,7 +116,6 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
     }
 
     // Skip expensive paginated key listing most of the time.
-    // Callers that write mutations reset refreshes_since_list to 0.
     journal.refreshes_since_list += 1;
     if journal.refreshes_since_list < RELIST_INTERVAL && !journal.all_keys.is_empty() {
         return false;
@@ -186,6 +185,49 @@ pub fn maybe_compact(journal: &mut JournalState) {
         _ => return,
     };
 
+    do_compact(journal, &kv);
+}
+
+/// Unconditionally compact: re-list delta keys from KV, re-read snapshot
+/// generation, and fold everything into the snapshot. Called on sandbox
+/// shutdown to catch writes that accumulated after the last `maybe_compact`.
+pub fn force_compact(journal: &mut JournalState) {
+    let kv = match KVStore::open(KV_STORE_NAME) {
+        Ok(Some(kv)) => kv,
+        _ => return,
+    };
+
+    // Re-read snapshot generation — another sandbox may have compacted.
+    let current_gen = kv
+        .build_lookup()
+        .execute(SNAPSHOT_KEY)
+        .map_or(0, |resp| resp.current_generation());
+    journal.snapshot_gen = current_gen;
+
+    // Re-list all delta keys and repopulate delta_keys.
+    let keys = list_delta_keys(&kv);
+    let boundary = journal.current_boundary.as_ref();
+    journal.delta_keys = boundary.map_or_else(
+        || keys.clone(),
+        |b| {
+            keys.iter()
+                .filter(|k| k.as_str() > b.as_str())
+                .cloned()
+                .collect()
+        },
+    );
+    journal.all_keys = keys;
+
+    if journal.delta_keys.is_empty() {
+        return;
+    }
+
+    do_compact(journal, &kv);
+}
+
+/// Shared compaction logic: write snapshot via CAS, rotate boundaries,
+/// and delete old delta keys.
+fn do_compact(journal: &mut JournalState, kv: &KVStore) {
     let snapshot_body = journal.stmts.join("\n");
     let last_delta = match journal.delta_keys.last() {
         Some(k) => k.clone(),

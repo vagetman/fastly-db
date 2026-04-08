@@ -20,7 +20,15 @@ fn main() -> Result<(), Error> {
         .with_max_requests(100)
         .with_timeout(Duration::from_secs(15))
         .run_with_context(handle, &mut ctx)
-        .into_result()
+        .into_result()?;
+
+    // Sandbox is shutting down — compact unconditionally to fold
+    // any remaining delta keys into the snapshot.
+    if let Some(journal) = ctx.journal.as_mut() {
+        db::force_compact(journal);
+    }
+
+    Ok(())
 }
 
 fn ensure_db(ctx: &mut AppContext) {
@@ -72,7 +80,6 @@ fn handle(mut req: Request, ctx: &mut AppContext) -> Result<Response, Error> {
                             .journal
                             .as_mut()
                             .expect("journal initialized by ensure_db");
-                        journal.refreshes_since_list = 0;
                         db::maybe_compact(journal);
                     }
                     Ok(Response::from_status(StatusCode::OK)
