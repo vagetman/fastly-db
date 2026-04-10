@@ -24,8 +24,8 @@ fn main() -> Result<(), Error> {
 
     // Sandbox is shutting down — compact unconditionally to fold
     // any remaining delta keys into the snapshot.
-    if let (Some(journal), Some(glue)) = (ctx.journal.as_mut(), ctx.glue.as_ref()) {
-        db::force_compact(journal, &glue.storage);
+    if let (Some(journal), Some(_glue)) = (ctx.journal.as_mut(), ctx.glue.as_ref()) {
+        db::force_compact(journal);
     }
 
     Ok(())
@@ -64,28 +64,61 @@ fn handle(mut req: Request, ctx: &mut AppContext) -> Result<Response, Error> {
             ensure_db(ctx);
             let glue = ctx.glue.as_mut().expect("db initialized by ensure_db");
 
+            // If this looks like a mutation, snapshot the current in-memory
+            // state so we can roll back if persisting to KV fails.
+            let pre_snapshot = if db::looks_like_mutation(&sql) {
+                bincode::serialize(&glue.storage).ok()
+            } else {
+                None
+            };
+
             match db::execute_query(glue, &sql) {
                 Ok((json, has_mutations)) => {
                     if has_mutations {
-                        if let Err(err) = db::append_to_log(&sql) {
-                            let body = serde_json::json!({
-                                "error": format!("query executed but failed to persist: {}", err)
-                            })
-                            .to_string();
-                            return Ok(Response::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+                        match db::append_to_log(&sql) {
+                            Ok(key) => {
+                                // Track the delta key this sandbox wrote so that
+                                // refresh_db/force_compact preserve it.
+                                let journal = ctx
+                                    .journal
+                                    .as_mut()
+                                    .expect("journal initialized by ensure_db");
+                                if !key.is_empty() {
+                                    journal.local_keys.push(key.clone());
+                                    journal.delta_keys.push(key);
+                                    journal.delta_keys.sort();
+                                }
+                            }
+                            Err(err) => {
+                                // Persistence failed: roll back in-memory mutation
+                                // so a 500 never leaves an unpersisted write applied.
+                                if let Some(bytes) = pre_snapshot.as_deref() {
+                                    if let Ok(restored) = bincode::deserialize(bytes) {
+                                        glue.storage = restored;
+                                    }
+                                } else {
+                                    // Fallback: reload from KV (best effort).
+                                    let (new_glue, new_journal) = db::load_db();
+                                    ctx.glue = Some(new_glue);
+                                    ctx.journal = Some(new_journal);
+                                }
+
+                                let body = serde_json::json!({
+                                    "error": format!("query executed but failed to persist: {}", err)
+                                })
+                                .to_string();
+                                return Ok(Response::from_status(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                )
                                 .with_content_type(mime::APPLICATION_JSON)
                                 .with_body(body));
+                            }
                         }
                         let journal = ctx
                             .journal
                             .as_mut()
                             .expect("journal initialized by ensure_db");
-                        let storage = &ctx
-                            .glue
-                            .as_ref()
-                            .expect("db initialized by ensure_db")
-                            .storage;
-                        db::maybe_compact(journal, storage);
+                        db::maybe_compact(journal);
                     }
                     Ok(Response::from_status(StatusCode::OK)
                         .with_content_type(mime::APPLICATION_JSON)

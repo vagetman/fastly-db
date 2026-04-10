@@ -39,6 +39,9 @@ const SNAPSHOT_KEY_B: &str = "__meta_snapshot_b";
 const COMPACT_KEY_THRESHOLD: usize = 50;
 const COMPACT_AGE_SECS: u64 = 300;
 const RELIST_INTERVAL: u32 = 10;
+/// How many seconds a key must exist before the boundary can advance past it.
+/// Prevents orphaning keys that KV LIST hasn't propagated yet.
+const BOUNDARY_SAFETY_SECS: u64 = 60;
 
 /// Paginate through all `__sql_*` keys in the KV store and return them sorted.
 fn list_delta_keys(kv: &KVStore) -> Vec<String> {
@@ -76,6 +79,11 @@ pub struct JournalState {
     pub boundary_a: Option<String>,
     pub boundary_b: Option<String>,
     pub refreshes_since_list: u32,
+    /// Delta keys written by THIS sandbox via append_to_log.
+    /// Used to prevent replay_missing_deltas from re-replaying our own writes
+    /// (which would create duplicate rows), and to ensure force_compact and
+    /// refresh_db preserve our acknowledged writes across snapshot reloads.
+    pub local_keys: Vec<String>,
 }
 
 impl JournalState {
@@ -113,6 +121,7 @@ impl JournalState {
 
     /// Returns (key, generation) of the stale slot — the one with the older
     /// boundary. This is the next compaction target.
+    #[allow(dead_code)]
     pub fn stale_slot(&self) -> (&str, u64) {
         match (&self.boundary_a, &self.boundary_b) {
             (Some(a), Some(b)) => {
@@ -190,6 +199,7 @@ pub fn load_db() -> (Glue<MemoryStorage>, JournalState) {
                     boundary_a: None,
                     boundary_b: None,
                     refreshes_since_list: 0,
+                    local_keys: Vec::new(),
                 },
             )
         }
@@ -270,6 +280,7 @@ pub fn load_db() -> (Glue<MemoryStorage>, JournalState) {
         boundary_a,
         boundary_b,
         refreshes_since_list: 0,
+        local_keys: Vec::new(),
     };
 
     (glue, journal)
@@ -277,8 +288,9 @@ pub fn load_db() -> (Glue<MemoryStorage>, JournalState) {
 
 /// Incrementally refresh the database by loading only new delta keys since
 /// the last known state. If either snapshot generation changed (another sandbox
-/// compacted), falls back to a full reload.
-/// Returns true if a full reload was performed.
+/// compacted), updates metadata and replays missing deltas while preserving
+/// the current in-memory state (which contains this sandbox's acknowledged writes).
+/// Returns true if a generation change was detected.
 pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) -> bool {
     let kv = match KVStore::open(KV_STORE_NAME) {
         Ok(Some(kv)) => kv,
@@ -296,10 +308,66 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
         .map_or(0, |resp| resp.current_generation());
 
     if current_gen_a != journal.gen_a || current_gen_b != journal.gen_b {
-        // Another sandbox compacted — full reload needed
-        let (new_glue, new_journal) = load_db();
-        *glue = new_glue;
-        *journal = new_journal;
+        // Another sandbox compacted.  Do NOT replace in-memory state with
+        // load_db() — that would discard our own acknowledged writes that may
+        // not be in the new snapshot (KV LIST eventual consistency across PoPs).
+        //
+        // Instead: update metadata, ensure our local keys are "known", then
+        // replay any delta keys from other sandboxes we haven't seen.
+        let our_boundary = journal.current_boundary().cloned();
+
+        // Update generations and boundaries to current values.
+        let (_, boundary_a) = read_slot_meta(&kv, SNAPSHOT_KEY_A);
+        let (_, boundary_b) = read_slot_meta(&kv, SNAPSHOT_KEY_B);
+        journal.gen_a = current_gen_a;
+        journal.gen_b = current_gen_b;
+        journal.boundary_a = boundary_a;
+        journal.boundary_b = boundary_b;
+
+        // Put our local keys into delta_keys so they're treated as "known".
+        {
+            let known: std::collections::HashSet<&str> =
+                journal.delta_keys.iter().map(|s| s.as_str()).collect();
+            let to_add: Vec<String> = journal
+                .local_keys
+                .iter()
+                .filter(|key| !known.contains(key.as_str()))
+                .cloned()
+                .collect();
+            journal.delta_keys.extend(to_add);
+            journal.delta_keys.sort();
+        }
+
+        // Re-list and replay keys > our old boundary that we haven't seen.
+        let keys = list_delta_keys(&kv);
+        let known: std::collections::HashSet<&str> =
+            journal.delta_keys.iter().map(|s| s.as_str()).collect();
+        let missing: Vec<String> = keys
+            .iter()
+            .filter(|k| {
+                our_boundary
+                    .as_ref()
+                    .map_or(true, |b| k.as_str() > b.as_str())
+                    && !known.contains(k.as_str())
+            })
+            .cloned()
+            .collect();
+
+        for key in &missing {
+            if let Ok(mut resp) = kv.lookup(key) {
+                let body = resp.take_body().into_string();
+                for line in body.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+                    block_on(glue.execute(line)).ok();
+                }
+            }
+        }
+
+        if !missing.is_empty() {
+            journal.delta_keys.extend(missing);
+            journal.delta_keys.sort();
+        }
+        journal.all_keys = keys;
+        journal.refreshes_since_list = 0;
         return true;
     }
 
@@ -311,10 +379,7 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
     journal.refreshes_since_list = 0;
 
     // Determine the boundary: newest key we've already seen
-    let boundary = journal
-        .delta_keys
-        .last()
-        .or(journal.current_boundary());
+    let boundary = journal.delta_keys.last().or(journal.current_boundary());
 
     // List all delta keys
     let keys = list_delta_keys(&kv);
@@ -353,9 +418,7 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
 
 /// Try to compact the journal if enough delta keys have accumulated or
 /// the oldest delta is older than 5 minutes.
-/// Uses CAS (if_generation_match) to prevent concurrent compaction across regions.
-/// Deletes only keys older than the previous compaction boundary (2-generation lag).
-pub fn maybe_compact(journal: &mut JournalState, storage: &MemoryStorage) {
+pub fn maybe_compact(journal: &mut JournalState) {
     if journal.delta_keys.is_empty() {
         return;
     }
@@ -369,106 +432,213 @@ pub fn maybe_compact(journal: &mut JournalState, storage: &MemoryStorage) {
         _ => return,
     };
 
-    do_compact(journal, &kv, storage);
+    do_compact(journal, &kv);
 }
 
-/// Unconditionally compact: re-list delta keys from KV, re-read snapshot
-/// generations, and fold everything into the snapshot. Called on sandbox
-/// shutdown to catch writes that accumulated after the last `maybe_compact`.
-pub fn force_compact(journal: &mut JournalState, storage: &MemoryStorage) {
+/// Unconditionally compact on sandbox shutdown.
+/// CAS retries up to 3 times. If all fail, our local delta keys are still in
+/// KV and will be picked up by the next compaction cycle (they're protected by
+/// the conservative boundary — no compactor will set a boundary past them
+/// until they're old enough to be visible in LIST, and age-gated deletion
+/// won't remove them until COMPACT_AGE_SECS).
+pub fn force_compact(journal: &mut JournalState) {
     let kv = match KVStore::open(KV_STORE_NAME) {
         Ok(Some(kv)) => kv,
         _ => return,
     };
 
-    // Re-read both snapshot generations — another sandbox may have compacted.
-    journal.gen_a = kv
-        .build_lookup()
-        .execute(SNAPSHOT_KEY_A)
-        .map_or(0, |resp| resp.current_generation());
-    journal.gen_b = kv
-        .build_lookup()
-        .execute(SNAPSHOT_KEY_B)
-        .map_or(0, |resp| resp.current_generation());
-
-    // Re-list all delta keys and repopulate delta_keys.
-    let keys = list_delta_keys(&kv);
-    let boundary = journal.current_boundary().cloned();
-    journal.delta_keys = boundary.as_ref().map_or_else(
-        || keys.clone(),
-        |b| {
-            keys.iter()
-                .filter(|k| k.as_str() > b.as_str())
-                .cloned()
-                .collect()
-        },
-    );
-    journal.all_keys = keys;
-
-    if journal.delta_keys.is_empty() {
-        return;
+    for _attempt in 0..3 {
+        if do_compact(journal, &kv) {
+            return;
+        }
     }
-
-    do_compact(journal, &kv, storage);
 }
 
-/// Shared compaction logic: serialize MemoryStorage via CAS to the stale slot,
-/// and delete old delta keys that both snapshots have folded in.
-fn do_compact(journal: &mut JournalState, kv: &KVStore, storage: &MemoryStorage) {
-    let snapshot_body = match bincode::serialize(storage) {
-        Ok(bytes) => bytes,
-        Err(_) => return,
+/// Self-contained compaction with a conservative boundary.
+///
+/// Instead of serializing the sandbox's in-memory state (which may be
+/// inconsistent with what's visible in KV LIST across PoPs), this function:
+///
+/// 1. Reads the latest snapshot from KV
+/// 2. Lists ALL delta keys (fresh LIST call)
+/// 3. Replays only keys between the old boundary and a conservative safe
+///    boundary (latest key that is >= BOUNDARY_SAFETY_SECS old)
+/// 4. CAS-writes the resulting state as a new snapshot
+///
+/// The conservative boundary ensures that recently-written delta keys from
+/// other sandboxes — which may not yet be visible in LIST — are NEVER
+/// covered by the boundary. They stay as delta keys and will be replayed
+/// by future load_db calls. This prevents:
+///   - DATA LOSS: boundary advancing past keys invisible in LIST
+///   - DUPLICATES: snapshot only contains data for keys explicitly replayed
+///
+/// Returns true on CAS success.
+fn do_compact(journal: &mut JournalState, kv: &KVStore) -> bool {
+    // 1. Read fresh metadata from both slots
+    let (gen_a, boundary_a) = read_slot_meta(kv, SNAPSHOT_KEY_A);
+    let (gen_b, boundary_b) = read_slot_meta(kv, SNAPSHOT_KEY_B);
+
+    // 2. Determine newer slot (source) and stale slot (target for writing)
+    let (source_key, current_boundary) = match (&boundary_a, &boundary_b) {
+        (Some(a), Some(b)) => {
+            if a.as_str() >= b.as_str() {
+                (Some(SNAPSHOT_KEY_A), Some(a.clone()))
+            } else {
+                (Some(SNAPSHOT_KEY_B), Some(b.clone()))
+            }
+        }
+        (Some(a), None) => (Some(SNAPSHOT_KEY_A), Some(a.clone())),
+        (None, Some(b)) => (Some(SNAPSHOT_KEY_B), Some(b.clone())),
+        (None, None) => (None, None),
     };
-    let last_delta = match journal.delta_keys.last() {
-        Some(k) => k.clone(),
-        None => return,
+
+    let (target_key, target_gen) = match (&boundary_a, &boundary_b) {
+        (Some(a), Some(b)) => {
+            if a.as_str() < b.as_str() {
+                (SNAPSHOT_KEY_A, gen_a)
+            } else {
+                (SNAPSHOT_KEY_B, gen_b)
+            }
+        }
+        (Some(_), None) => (SNAPSHOT_KEY_B, gen_b),
+        (None, Some(_)) => (SNAPSHOT_KEY_A, gen_a),
+        (None, None) => (SNAPSHOT_KEY_A, gen_a),
     };
 
-    let (slot_key, slot_gen) = journal.stale_slot();
-    let slot_key = slot_key.to_owned();
+    // 3. List all delta keys
+    let keys = list_delta_keys(kv);
 
-    // Build metadata JSON: just the boundary for this slot
-    let meta = serde_json::json!({ "current": &last_delta });
-    let meta_str = meta.to_string();
+    // 4. Find eligible keys (> current boundary)
+    let eligible: Vec<&String> = keys
+        .iter()
+        .filter(|k| current_boundary.as_ref().map_or(true, |b| k.as_str() > b.as_str()))
+        .collect();
 
-    // CAS write: only succeeds if the slot's generation hasn't changed since we read it.
-    // Evaluated at the central storage backend — exactly one writer wins across all regions.
-    if kv
-        .build_insert()
-        .mode(InsertMode::Overwrite)
-        .if_generation_match(slot_gen)
-        .metadata(&meta_str)
-        .execute(&slot_key, snapshot_body)
-        .is_err()
-    {
-        return;
+    if eligible.is_empty() {
+        return false;
     }
 
-    // CAS succeeded — update journal state for the written slot.
-    let new_gen = kv
-        .build_lookup()
-        .execute(&slot_key)
-        .map_or(0, |resp| resp.current_generation());
-    if slot_key == SNAPSHOT_KEY_A {
-        journal.gen_a = new_gen;
-        journal.boundary_a = Some(last_delta);
+    // 5. Conservative boundary: latest eligible key >= BOUNDARY_SAFETY_SECS old
+    let now_secs = Uuid::now_v7()
+        .get_timestamp()
+        .map(|ts| ts.to_unix().0)
+        .unwrap_or(0);
+
+    let safe_boundary = eligible
+        .iter()
+        .rev()
+        .find(|k| {
+            let uuid_str = k.trim_start_matches(SQL_KEY_PREFIX);
+            Uuid::parse_str(uuid_str)
+                .ok()
+                .and_then(|u| u.get_timestamp())
+                .map(|ts| {
+                    let (key_secs, _) = ts.to_unix();
+                    now_secs.saturating_sub(key_secs) >= BOUNDARY_SAFETY_SECS
+                })
+                .unwrap_or(false)
+        })
+        .cloned()
+        .cloned();
+
+    let safe_boundary = match safe_boundary {
+        Some(k) => k,
+        None => return false, // All eligible keys are too recent
+    };
+
+    // 6. Load source snapshot from KV (not from in-memory state!)
+    let storage = if let Some(key) = source_key {
+        if let Ok(mut resp) = kv.build_lookup().execute(key) {
+            let body_bytes = resp.take_body().into_bytes();
+            deserialize_snapshot(&body_bytes)
+        } else {
+            MemoryStorage::default()
+        }
     } else {
-        journal.gen_b = new_gen;
-        journal.boundary_b = Some(last_delta);
-    }
-    journal.delta_keys.clear();
+        MemoryStorage::default()
+    };
+    let mut glue = Glue::new(storage);
 
-    // Delete delta keys older than the older boundary.
-    // Both snapshots have folded these in, so they're safe to remove.
-    if let Some(older) = journal.older_boundary() {
-        let older = older.clone();
-        for key in &journal.all_keys {
-            if key.as_str() <= older.as_str() {
-                kv.delete(key).ok();
+    // 7. Replay ONLY keys between current boundary and safe boundary
+    for key in &keys {
+        let after_boundary = current_boundary.as_ref().map_or(true, |b| key.as_str() > b.as_str());
+        if after_boundary && key.as_str() <= safe_boundary.as_str() {
+            if let Ok(mut resp) = kv.lookup(key) {
+                let body = resp.take_body().into_string();
+                for line in body.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+                    block_on(glue.execute(line)).ok();
+                }
             }
         }
     }
 
+    // 8. Serialize the compaction snapshot
+    let snapshot_body = match bincode::serialize(&glue.storage) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+
+    // 9. CAS write to the stale slot
+    let meta = serde_json::json!({ "current": &safe_boundary });
+    let meta_str = meta.to_string();
+
+    if kv
+        .build_insert()
+        .mode(InsertMode::Overwrite)
+        .if_generation_match(target_gen)
+        .metadata(&meta_str)
+        .execute(target_key, snapshot_body)
+        .is_err()
+    {
+        return false;
+    }
+
+    // 10. Update journal metadata
+    let new_gen = kv
+        .build_lookup()
+        .execute(target_key)
+        .map_or(0, |resp| resp.current_generation());
+
+    if target_key == SNAPSHOT_KEY_A {
+        journal.gen_a = new_gen;
+        journal.gen_b = gen_b;
+        journal.boundary_a = Some(safe_boundary.clone());
+        journal.boundary_b = boundary_b;
+    } else {
+        journal.gen_a = gen_a;
+        journal.gen_b = new_gen;
+        journal.boundary_a = boundary_a;
+        journal.boundary_b = Some(safe_boundary.clone());
+    }
+
+    // Only remove delta keys that are now covered by the boundary
+    journal.delta_keys.retain(|k| k.as_str() > safe_boundary.as_str());
+    journal.all_keys = keys;
+
+    // 11. Age-gated deletion: only delete keys older than COMPACT_AGE_SECS
+    //     that are behind the older boundary (both snapshots have folded them).
+    if let Some(older) = journal.older_boundary() {
+        let older = older.clone();
+        for key in &journal.all_keys {
+            if key.as_str() <= older.as_str() {
+                let uuid_str = key.trim_start_matches(SQL_KEY_PREFIX);
+                let old_enough = Uuid::parse_str(uuid_str)
+                    .ok()
+                    .and_then(|u| u.get_timestamp())
+                    .map(|ts| {
+                        let (key_secs, _) = ts.to_unix();
+                        now_secs.saturating_sub(key_secs) >= COMPACT_AGE_SECS
+                    })
+                    .unwrap_or(false);
+
+                if old_enough {
+                    kv.delete(key).ok();
+                }
+            }
+        }
+    }
+
+    true
 }
 
 fn should_compact(journal: &JournalState) -> bool {
@@ -588,26 +758,58 @@ pub fn execute_query(glue: &mut Glue<MemoryStorage>, sql: &str) -> Result<(Strin
         .map_err(|e| e.to_string())
 }
 
+/// Best-effort check whether the SQL likely mutates state.
+/// Used to decide if we should take a pre-execution snapshot for rollback.
+pub fn looks_like_mutation(sql: &str) -> bool {
+    let s = sql.trim_start();
+    if s.is_empty() {
+        return false;
+    }
+    // Case-insensitive prefix check without allocations.
+    let upper = s
+        .bytes()
+        .take(16)
+        .map(|b| (b as char).to_ascii_uppercase())
+        .collect::<String>();
+
+    upper.starts_with("INSERT")
+        || upper.starts_with("UPDATE")
+        || upper.starts_with("DELETE")
+        || upper.starts_with("CREATE")
+        || upper.starts_with("DROP")
+        || upper.starts_with("ALTER")
+        || upper.starts_with("TRUNCATE")
+}
+
 /// Append the user's SQL to a new sharded journal key (concurrent-safe).
 /// Returns an error if the KV store is unavailable or the write fails.
-pub fn append_to_log(new_sql: &str) -> Result<(), String> {
+/// Append the user's SQL to a new sharded journal key (concurrent-safe).
+/// Returns the delta key name on success so the caller can track it.
+pub fn append_to_log(new_sql: &str) -> Result<String, String> {
     // Normalize newlines so the line-based journal format stays intact,
     // but do NOT split on ';' — that breaks string literals like 'a;b'.
     let sql = new_sql.replace(['\n', '\r'], " ");
     let sql = sql.trim();
     if sql.is_empty() {
-        return Ok(());
+        return Ok(String::new());
     }
 
     let kv = KVStore::open(KV_STORE_NAME)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("KV store '{}' not found", KV_STORE_NAME))?;
 
-    let key = format!("{}{}", SQL_KEY_PREFIX, Uuid::now_v7());
-    kv.build_insert()
-        .mode(InsertMode::Add)
-        .execute(&key, sql)
-        .map_err(|e| e.to_string())
+    // KV can occasionally return transient errors under load. Retry a few
+    // times before failing the request.
+    let mut last_err: Option<String> = None;
+    for _ in 0..3 {
+        let key = format!("{}{}", SQL_KEY_PREFIX, Uuid::now_v7());
+        match kv.build_insert().mode(InsertMode::Add).execute(&key, sql) {
+            Ok(()) => return Ok(key),
+            Err(e) => last_err = Some(e.to_string()),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| "unknown KV error".to_string()))
 }
 
 /// Query actual schema from GlueSQL's data dictionary tables.
@@ -656,8 +858,6 @@ pub fn get_schema(glue: &mut Glue<MemoryStorage>) -> Result<String, String> {
 
     serde_json::to_string_pretty(&schema).map_err(|e| e.to_string())
 }
-
-
 
 fn value_to_json(v: Value) -> serde_json::Value {
     match v {

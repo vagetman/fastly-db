@@ -1,4 +1,4 @@
--- write.lua — wrk2 script: POST /query with INSERT statements
+-- write.lua — wrk script: POST /query with INSERT statements
 -- Each request inserts a row with a unique id derived from the thread/request counter.
 
 local counter = 0

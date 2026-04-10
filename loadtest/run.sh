@@ -19,7 +19,7 @@ Options:
   --setup          Run setup.sh first to create/seed the test table
   -d, --duration   Test duration          (default: ${DURATION})
   -c, --connections Number of connections (default: ${CONNECTIONS})
-  -R, --rate       Target req/s (wrk2)    (default: ${RATE})
+  -R, --rate       Target req/s            (default: ${RATE})
   -t, --threads    Number of threads      (default: ${THREADS})
   --timeout        Request timeout         (default: ${TIMEOUT})
   -h, --help       Show this help
@@ -46,21 +46,12 @@ BASE_URL="${BASE_URL:?Error: service URL required. Run with --help for usage.}"
 BASE_URL="${BASE_URL%/}"
 
 # --- detect wrk variant ------------------------------------------------------
-if command -v wrk2 &>/dev/null; then
-  WRK=wrk2
-  RATE_FLAG="-R ${RATE}"
-elif command -v wrk &>/dev/null; then
-  WRK=wrk
-  RATE_FLAG=""
-  echo "WARNING: wrk2 not found; falling back to wrk (no constant-rate control)."
-  echo "         Install wrk2 for accurate latency percentiles: brew install wrk2"
-  echo
-else
-  echo "ERROR: Neither wrk2 nor wrk found. Install one first:"
-  echo "  brew install wrk2   # recommended"
-  echo "  brew install wrk"
+if ! command -v wrk &>/dev/null; then
+  echo "ERROR: wrk not found. Install: brew install wrk"
   exit 1
 fi
+WRK=wrk
+RATE_FLAG=""
 
 # --- setup --------------------------------------------------------------------
 if $SETUP; then

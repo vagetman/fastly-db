@@ -1,4 +1,4 @@
--- read.lua — wrk2 script: POST /query with a SELECT statement
+-- read.lua — wrk script: POST /query with a SELECT statement
 
 wrk.method = "POST"
 wrk.path   = "/query"
