@@ -437,11 +437,11 @@ do_verify() {
   # If we're using the manifest, enforce strict preconditions when running strict verification.
   # Without strict mode (one connection per thread), wrk can have in-flight requests at cutoff
   # that may or may not reach the server, making seq-based proofs ambiguous.
-  local manifest_ok_sum="" manifest_err_sum="" manifest_inflight_sum=""
+  local manifest_ok_sum="" manifest_err_sum="" manifest_attempted_sum=""
   if $using_manifest; then
     manifest_ok_sum=$(extract_count "$(query_or_die "SELECT SUM(ok) AS ok FROM integrity_manifest WHERE run='${RUN}'" "manifest ok sum")")
     manifest_err_sum=$(extract_count "$(query_or_die "SELECT SUM(err) AS err FROM integrity_manifest WHERE run='${RUN}'" "manifest err sum")")
-    manifest_inflight_sum=$(extract_count "$(query_or_die "SELECT SUM(inflight) AS inflight FROM integrity_manifest WHERE run='${RUN}'" "manifest inflight sum")")
+    manifest_attempted_sum=$(extract_count "$(query_or_die "SELECT SUM(attempted) AS attempted FROM integrity_manifest WHERE run='${RUN}'" "manifest attempted sum")")
 
     if (( manifest_err_sum != 0 )); then
       echo "  FAIL: writers reported HTTP errors (SUM(err)=${manifest_err_sum}); run not valid"
@@ -468,21 +468,21 @@ do_verify() {
       loc_count=$(extract_count "$cnt_result")
 
       if $using_manifest; then
-        local ok_json ok_expected inflight_json loc_inflight
+        local ok_json ok_expected attempted_json loc_attempted
         ok_json=$(query_or_die \
           "SELECT ok AS ok FROM integrity_manifest WHERE run = '${RUN}' AND loc = '${l}'" \
           "manifest ok for ${l}")
         ok_expected=$(extract_count "$ok_json")
-        inflight_json=$(query_or_die \
-          "SELECT inflight AS inflight FROM integrity_manifest WHERE run = '${RUN}' AND loc = '${l}'" \
-          "manifest inflight for ${l}")
-        loc_inflight=$(extract_count "$inflight_json")
-        echo "    ${l}: ${loc_count} rows (expected ok=${ok_expected}, inflight=${loc_inflight})"
+        attempted_json=$(query_or_die \
+          "SELECT attempted AS attempted FROM integrity_manifest WHERE run = '${RUN}' AND loc = '${l}'" \
+          "manifest attempted for ${l}")
+        loc_attempted=$(extract_count "$attempted_json")
+        echo "    ${l}: ${loc_count} rows (ok=${ok_expected}, attempted=${loc_attempted})"
         if (( loc_count < ok_expected )); then
           echo "    FAIL: ${l} DATA LOSS — fewer rows than acknowledged (${loc_count} < ${ok_expected})"
           pass=false
-        elif (( loc_count > ok_expected + loc_inflight )); then
-          echo "    FAIL: ${l} extra rows beyond ok+inflight (${loc_count} > $(( ok_expected + loc_inflight )))"
+        elif (( loc_count > loc_attempted )); then
+          echo "    FAIL: ${l} more rows than attempted (${loc_count} > ${loc_attempted})"
           pass=false
         fi
       else
@@ -636,19 +636,15 @@ do_verify() {
   fi
 
   if [[ -n "${expected_total}" ]]; then
-    local max_expected=$(( expected_total + ${manifest_inflight_sum:-0} ))
+    local max_total=${manifest_attempted_sum:-${expected_total}}
     if (( total < expected_total )); then
-      echo "  FAIL: DATA LOSS — fewer rows than acknowledged (${total} < ${expected_total})"
-      echo "        At least $(( expected_total - total )) acknowledged writes missing"
+      echo "  FAIL: DATA LOSS — ${total} rows < ${expected_total} acknowledged"
       pass=false
-    elif (( total > max_expected )); then
-      echo "  FAIL: more rows than ok+inflight (${total} > ${max_expected})"
-      echo "        This means writes appeared that were never even attempted."
+    elif (( total > max_total )); then
+      echo "  FAIL: ${total} rows > ${max_total} attempted — phantom writes"
       pass=false
-    elif (( total == expected_total )); then
-      echo "  OK: row count matches expected — all acknowledged writes present, no extras"
     else
-      echo "  OK: all acknowledged writes present (${total} rows; ok=${expected_total}, inflight=${manifest_inflight_sum:-0})"
+      echo "  OK: ${total} rows, all ${expected_total} acknowledged writes present"
     fi
   else
     echo "  FAIL: no expected count available; cannot verify completeness."

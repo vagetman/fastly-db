@@ -8,9 +8,11 @@ edition = "2021"
 publish = false
 
 [profile.release]
-debug = 1
+debug = 0
 codegen-units = 1
 lto = "fat"
+opt-level = "s"
+strip = true
 
 [dependencies]
 fastly = "0.12.0"

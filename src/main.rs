@@ -66,8 +66,9 @@ fn handle(mut req: Request, ctx: &mut AppContext) -> Result<Response, Error> {
 
             // If this looks like a mutation, snapshot the current in-memory
             // state so we can roll back if persisting to KV fails.
+            // MemoryStorage uses `im` persistent data-structures so clone is O(1).
             let pre_snapshot = if db::looks_like_mutation(&sql) {
-                bincode::serialize(&glue.storage).ok()
+                Some(glue.storage.clone())
             } else {
                 None
             };
@@ -85,17 +86,17 @@ fn handle(mut req: Request, ctx: &mut AppContext) -> Result<Response, Error> {
                                     .expect("journal initialized by ensure_db");
                                 if !key.is_empty() {
                                     journal.local_keys.push(key.clone());
+                                    // UUIDv7 is monotonic — new key is always
+                                    // the largest, so push alone keeps the vec
+                                    // sorted; no need to re-sort.
                                     journal.delta_keys.push(key);
-                                    journal.delta_keys.sort();
                                 }
                             }
                             Err(err) => {
                                 // Persistence failed: roll back in-memory mutation
                                 // so a 500 never leaves an unpersisted write applied.
-                                if let Some(bytes) = pre_snapshot.as_deref() {
-                                    if let Ok(restored) = bincode::deserialize(bytes) {
-                                        glue.storage = restored;
-                                    }
+                                if let Some(restored) = pre_snapshot {
+                                    glue.storage = restored;
                                 } else {
                                     // Fallback: reload from KV (best effort).
                                     let (new_glue, new_journal) = db::load_db();

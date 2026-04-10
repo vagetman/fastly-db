@@ -38,7 +38,6 @@ const SNAPSHOT_KEY_A: &str = "__meta_snapshot_a";
 const SNAPSHOT_KEY_B: &str = "__meta_snapshot_b";
 const COMPACT_KEY_THRESHOLD: usize = 50;
 const COMPACT_AGE_SECS: u64 = 300;
-const RELIST_INTERVAL: u32 = 10;
 /// How many seconds a key must exist before the boundary can advance past it.
 /// Prevents orphaning keys that KV LIST hasn't propagated yet.
 const BOUNDARY_SAFETY_SECS: u64 = 60;
@@ -78,7 +77,6 @@ pub struct JournalState {
     pub gen_b: u64,
     pub boundary_a: Option<String>,
     pub boundary_b: Option<String>,
-    pub refreshes_since_list: u32,
     /// Delta keys written by THIS sandbox via append_to_log.
     /// Used to prevent replay_missing_deltas from re-replaying our own writes
     /// (which would create duplicate rows), and to ensure force_compact and
@@ -198,7 +196,6 @@ pub fn load_db() -> (Glue<MemoryStorage>, JournalState) {
                     gen_b: 0,
                     boundary_a: None,
                     boundary_b: None,
-                    refreshes_since_list: 0,
                     local_keys: Vec::new(),
                 },
             )
@@ -279,17 +276,16 @@ pub fn load_db() -> (Glue<MemoryStorage>, JournalState) {
         gen_b,
         boundary_a,
         boundary_b,
-        refreshes_since_list: 0,
         local_keys: Vec::new(),
     };
 
     (glue, journal)
 }
 
-/// Incrementally refresh the database by loading only new delta keys since
-/// the last known state. If either snapshot generation changed (another sandbox
-/// compacted), updates metadata and replays missing deltas while preserving
-/// the current in-memory state (which contains this sandbox's acknowledged writes).
+/// Refresh in-memory state from KV. On every request:
+///   1. Check if generation changed (another sandbox compacted).
+///      If yes — update metadata, ensure our local keys are preserved.
+///   2. List delta keys, replay any we haven't seen.
 /// Returns true if a generation change was detected.
 pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) -> bool {
     let kv = match KVStore::open(KV_STORE_NAME) {
@@ -297,111 +293,51 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
         _ => return false,
     };
 
-    // Check if either snapshot generation changed (another sandbox compacted)
-    let current_gen_a = kv
-        .build_lookup()
-        .execute(SNAPSHOT_KEY_A)
-        .map_or(0, |resp| resp.current_generation());
-    let current_gen_b = kv
-        .build_lookup()
-        .execute(SNAPSHOT_KEY_B)
-        .map_or(0, |resp| resp.current_generation());
+    // 1. Check generation
+    let (current_gen_a, fresh_boundary_a) = read_slot_meta(&kv, SNAPSHOT_KEY_A);
+    let (current_gen_b, fresh_boundary_b) = read_slot_meta(&kv, SNAPSHOT_KEY_B);
 
-    if current_gen_a != journal.gen_a || current_gen_b != journal.gen_b {
-        // Another sandbox compacted.  Do NOT replace in-memory state with
-        // load_db() — that would discard our own acknowledged writes that may
-        // not be in the new snapshot (KV LIST eventual consistency across PoPs).
-        //
-        // Instead: update metadata, ensure our local keys are "known", then
-        // replay any delta keys from other sandboxes we haven't seen.
-        let our_boundary = journal.current_boundary().cloned();
+    let gen_changed = current_gen_a != journal.gen_a || current_gen_b != journal.gen_b;
 
-        // Update generations and boundaries to current values.
-        let (_, boundary_a) = read_slot_meta(&kv, SNAPSHOT_KEY_A);
-        let (_, boundary_b) = read_slot_meta(&kv, SNAPSHOT_KEY_B);
+    if gen_changed {
+        // Another sandbox compacted. Update metadata but keep in-memory state
+        // (discarding it would lose our own acknowledged writes that may not
+        // be in the new snapshot due to KV LIST eventual consistency).
         journal.gen_a = current_gen_a;
         journal.gen_b = current_gen_b;
-        journal.boundary_a = boundary_a;
-        journal.boundary_b = boundary_b;
+        journal.boundary_a = fresh_boundary_a;
+        journal.boundary_b = fresh_boundary_b;
 
-        // Put our local keys into delta_keys so they're treated as "known".
-        {
-            let known: std::collections::HashSet<&str> =
-                journal.delta_keys.iter().map(|s| s.as_str()).collect();
-            let to_add: Vec<String> = journal
-                .local_keys
-                .iter()
-                .filter(|key| !known.contains(key.as_str()))
-                .cloned()
-                .collect();
-            journal.delta_keys.extend(to_add);
-            journal.delta_keys.sort();
-        }
-
-        // Re-list and replay keys > our old boundary that we haven't seen.
-        let keys = list_delta_keys(&kv);
+        // Ensure our local keys are treated as "known" so they aren't
+        // re-replayed (which would cause duplicates).
         let known: std::collections::HashSet<&str> =
             journal.delta_keys.iter().map(|s| s.as_str()).collect();
-        let missing: Vec<String> = keys
+        let to_add: Vec<String> = journal
+            .local_keys
             .iter()
-            .filter(|k| {
-                our_boundary
-                    .as_ref()
-                    .map_or(true, |b| k.as_str() > b.as_str())
-                    && !known.contains(k.as_str())
-            })
+            .filter(|key| !known.contains(key.as_str()))
             .cloned()
             .collect();
-
-        for key in &missing {
-            if let Ok(mut resp) = kv.lookup(key) {
-                let body = resp.take_body().into_string();
-                for line in body.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
-                    block_on(glue.execute(line)).ok();
-                }
-            }
-        }
-
-        if !missing.is_empty() {
-            journal.delta_keys.extend(missing);
-            journal.delta_keys.sort();
-        }
-        journal.all_keys = keys;
-        journal.refreshes_since_list = 0;
-        return true;
+        journal.delta_keys.extend(to_add);
+        journal.delta_keys.sort();
     }
 
-    // Skip expensive paginated key listing most of the time.
-    journal.refreshes_since_list += 1;
-    if journal.refreshes_since_list < RELIST_INTERVAL && !journal.all_keys.is_empty() {
-        return false;
-    }
-    journal.refreshes_since_list = 0;
-
-    // Determine the boundary: newest key we've already seen
+    // 2. List delta keys and replay any we haven't seen
     let boundary = journal.delta_keys.last().or(journal.current_boundary());
 
-    // List all delta keys
     let keys = list_delta_keys(&kv);
 
-    // Find new keys beyond our boundary
-    let new_keys: Vec<String> = boundary.map_or_else(
-        || keys.clone(),
-        |b| {
-            keys.iter()
-                .filter(|k| k.as_str() > b.as_str())
-                .cloned()
-                .collect()
-        },
-    );
+    let known: std::collections::HashSet<&str> =
+        journal.delta_keys.iter().map(|s| s.as_str()).collect();
+    let new_keys: Vec<String> = keys
+        .iter()
+        .filter(|k| {
+            boundary.map_or(true, |b| k.as_str() > b.as_str())
+                && !known.contains(k.as_str())
+        })
+        .cloned()
+        .collect();
 
-    if new_keys.is_empty() {
-        // Update all_keys in case deletions happened
-        journal.all_keys = keys;
-        return false;
-    }
-
-    // Read and replay only the new delta keys
     for key in &new_keys {
         if let Ok(mut resp) = kv.lookup(key) {
             let body = resp.take_body().into_string();
@@ -411,9 +347,13 @@ pub fn refresh_db(glue: &mut Glue<MemoryStorage>, journal: &mut JournalState) ->
         }
     }
 
-    journal.delta_keys.extend(new_keys);
+    if !new_keys.is_empty() {
+        journal.delta_keys.extend(new_keys);
+        journal.delta_keys.sort();
+    }
     journal.all_keys = keys;
-    false
+
+    gen_changed
 }
 
 /// Try to compact the journal if enough delta keys have accumulated or
@@ -751,7 +691,7 @@ pub fn execute_query(glue: &mut Glue<MemoryStorage>, sql: &str) -> Result<(Strin
     }
 
     let envelope = serde_json::json!({ "results": all_rows });
-    let output = serde_json::to_string_pretty(&envelope);
+    let output = serde_json::to_string(&envelope);
 
     output
         .map(|json| (json, has_mutations))
@@ -765,20 +705,22 @@ pub fn looks_like_mutation(sql: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    // Case-insensitive prefix check without allocations.
-    let upper = s
-        .bytes()
-        .take(16)
-        .map(|b| (b as char).to_ascii_uppercase())
-        .collect::<String>();
-
-    upper.starts_with("INSERT")
-        || upper.starts_with("UPDATE")
-        || upper.starts_with("DELETE")
-        || upper.starts_with("CREATE")
-        || upper.starts_with("DROP")
-        || upper.starts_with("ALTER")
-        || upper.starts_with("TRUNCATE")
+    // Zero-allocation case-insensitive prefix check.
+    let bytes = s.as_bytes();
+    let matches = |prefix: &[u8]| {
+        bytes.len() >= prefix.len()
+            && bytes[..prefix.len()]
+                .iter()
+                .zip(prefix)
+                .all(|(a, b)| a.to_ascii_uppercase() == *b)
+    };
+    matches(b"INSERT")
+        || matches(b"UPDATE")
+        || matches(b"DELETE")
+        || matches(b"CREATE")
+        || matches(b"DROP")
+        || matches(b"ALTER")
+        || matches(b"TRUNCATE")
 }
 
 /// Append the user's SQL to a new sharded journal key (concurrent-safe).
@@ -788,8 +730,7 @@ pub fn looks_like_mutation(sql: &str) -> bool {
 pub fn append_to_log(new_sql: &str) -> Result<String, String> {
     // Normalize newlines so the line-based journal format stays intact,
     // but do NOT split on ';' — that breaks string literals like 'a;b'.
-    let sql = new_sql.replace(['\n', '\r'], " ");
-    let sql = sql.trim();
+    let sql = new_sql.trim().replace(['\n', '\r'], " ");
     if sql.is_empty() {
         return Ok(String::new());
     }
@@ -803,7 +744,7 @@ pub fn append_to_log(new_sql: &str) -> Result<String, String> {
     let mut last_err: Option<String> = None;
     for _ in 0..3 {
         let key = format!("{}{}", SQL_KEY_PREFIX, Uuid::now_v7());
-        match kv.build_insert().mode(InsertMode::Add).execute(&key, sql) {
+        match kv.build_insert().mode(InsertMode::Add).execute(&key, sql.as_str()) {
             Ok(()) => return Ok(key),
             Err(e) => last_err = Some(e.to_string()),
         }
@@ -856,7 +797,7 @@ pub fn get_schema(glue: &mut Glue<MemoryStorage>) -> Result<String, String> {
         }
     }
 
-    serde_json::to_string_pretty(&schema).map_err(|e| e.to_string())
+    serde_json::to_string(&schema).map_err(|e| e.to_string())
 }
 
 fn value_to_json(v: Value) -> serde_json::Value {
